@@ -1,0 +1,219 @@
+import os
+import cv2
+import numpy as np
+import math as mh
+import json
+from sklearn.utils.linear_assignment_ import linear_assignment
+from collections import Counter
+
+class Info:
+    def __init__(self, frame_idx='', err_x=0, err_y=0, err_w=0, err_h=0, err_r=0, err_s=0):
+        self.frame_idx = frame_idx
+        self.err_x = err_x
+        self.err_y = err_y
+        self.err_w = err_w
+        self.err_h = err_h
+        self.err_r = err_r
+        self.err_s = err_s
+def IoU(a, b):
+    """
+        Compute as VOC IoU method
+        a: x1, y1, x2, y2
+        b: x1, y1, x2, y2
+    """
+    if (not len(a)) or (not len(b)): return 0
+
+    x_min = np.maximum(a[0], b[0])
+    y_min = np.maximum(a[1], b[1])
+    x_max = np.minimum(a[2], b[2])
+    y_max = np.minimum(a[3], b[3])
+    w = np.maximum(0, x_max - x_min + 1.)
+    h = np.maximum(0, y_max - y_min + 1.)
+    inter = w * h
+    uni = (a[2] - a[0] + 1.) * (a[3] - a[1] + 1.) + (b[2] - b[0] + 1.) * (b[3] - b[1] + 1.) - inter
+    ov = inter / uni
+    return ov
+
+def BigraphMatch(gt_bbox, bbox, ov_thr=0.5):
+    if (len(gt_bbox) == 0):
+        return np.empty((0, 2), dtype=int), np.empty((0, 2), dtype=int)
+
+    iou_mat = np.zeros((len(gt_bbox), len(bbox)), dtype=np.float32)
+    for g, gt in enumerate(gt_bbox):
+        for d, det in enumerate(bbox):
+            iou_mat[g, d] = IoU(gt, det)
+
+    matched_indices = linear_assignment(-iou_mat)
+
+    unmatched_gt = []
+    for g, gt in enumerate(gt_bbox):
+        if (g not in matched_indices[:, 0]):
+            unmatched_gt.append(g)
+
+    # Filter out matched with low IoU
+    matched = []
+    for m in matched_indices:
+        if (iou_mat[m[0], m[1]] < ov_thr):
+            unmatched_gt.append(m[0])
+        else:
+            matched.append(m.reshape(1, 2))
+
+    if not len(matched):
+        matched = np.empty((0, 2), dtype=int)
+    else:
+        matched = np.concatenate(matched, axis=0)
+
+    return matched, unmatched_gt
+
+def GetStabilityErr(gt, det):
+    gt_x = (gt[0] + gt[2]) / 2.
+    gt_y = (gt[1] + gt[3]) / 2.
+
+    det_x = (det[0] + det[2]) / 2.
+    det_y = (det[1] + det[3]) / 2.
+
+    gt_w = gt[2] - gt[0]
+    gt_h = gt[3] - gt[1]
+    det_w = det[2] - det[0]
+    det_h = det[3] - det[1]
+
+    #return (det_x - gt_x) * 1. / gt_w, (det_y - gt_y) * 1. / gt_h, (det_w - gt_w) * 1. / gt_w, (det_h - gt_h) * 1. / gt_h, (1. * det_w / det_h - 1. * gt_w / gt_h) / (1. * gt_w / gt_h)
+    #return (det_x - gt_x) * 1. / gt_w, (det_y - gt_y) * 1. / gt_h, (det_w - gt_w) * 1. / gt_w, (det_h - gt_h) * 1. / gt_h, (1. * det_h / det_w - 1. * gt_h / gt_w) / (1. * gt_h / gt_w)
+
+    return (det_x - gt_x) * 1. / gt_w, (det_y - gt_y) * 1. / gt_h, (det_w - gt_w) * 1. / gt_w, (det_h - gt_h) * 1. / gt_h, (1. * det_w / det_h) / (1. * gt_w / gt_h) - 1,\
+            np.sqrt(1. * det_w * det_h) / np.sqrt(1. * gt_w * gt_h) - 1
+def CountContinueSeq(seq):
+    if len(seq) == 1: return 0
+    n = len(seq) - 1
+    fr = [seq[i] != seq[i - 1] for i in xrange(1, len(seq))]
+    return np.sum(fr) * 1. / n
+
+def TrajErr(anno_gt, assn_res):
+
+    var_c = []
+    var_r = []
+    F_err = []
+
+    for tr in anno_gt:
+
+        if not tr in assn_res.keys(): continue
+
+        _traj = assn_res[tr]
+
+        #print tr, gt_length, traj_length
+
+        _x = [x.err_x for x in _traj]
+        _y = [x.err_y for x in _traj]
+        _h = [x.err_h for x in _traj]
+        _w = [x.err_w for x in _traj]
+        _r = [x.err_r for x in _traj]
+        _s = [x.err_s for x in _traj]
+        #var_c.append(np.var(_x) + np.var(_y))
+        #var_r.append(np.var(_h) + np.var(_w))
+        var_c.append(np.std(_x) + np.std(_y))
+        #var_r.append(np.std(_h) + np.std(_w) + np.std(_r))
+        var_r.append(np.std(_s) + np.std(_r))
+        #var_r.append(np.std(_w) + np.std(_r))
+
+        assn_traj = set(sorted([x.frame_idx for x in _traj]))
+        traj_gt = sorted(anno_gt[tr])
+        traj_match = []
+        for idx in range(len(traj_gt)):
+            if traj_gt[idx] in assn_traj: traj_match.append(1)
+            else: traj_match.append(0)
+
+        _frag = CountContinueSeq(traj_match)
+        #print len(anno_gt[tr]), len(_traj), len(traj_match),  _frag
+        F_err.append(_frag)
+
+    return np.mean(F_err), np.mean(var_c), np.mean(var_r)
+
+def display(im_name, gt, det):
+    im_path = '/data01/kalviny/dataset/MOT/2016/train/MOT16-02/img1/'
+    rt_output = '/data01/kalviny/dataset/MOT/2016/train/MOT16-02/output/'
+    if not os.path.exists(rt_output): os.mkdir(rt_output)
+    #print os.path.join(im_path, '{}.jpg'.format('%06d' % int(im_name)))
+    im = cv2.imread(os.path.join(im_path, '{}.jpg'.format('%06d' %  int(im_name))))
+    cv2.rectangle(im, (int(gt[0]), int(gt[1])), (int(gt[2]), int(gt[3])), (0, 0, 255), 3)
+    cv2.rectangle(im, (int(det[0]), int(det[1])), (int(det[2]), int(det[3])), (0, 255, 0), 3)
+    cv2.imshow('im', im)
+    cv2.waitKey(2)
+    #cv2.imwrite(rt_output + im_name + '.jpg', im)
+    #cv2.imwrite()
+
+
+"""
+    Both anno and det are in the SAME class
+    anno: ground truth
+    format: {}
+            key: 
+                image name
+            val:
+                bbox: [x1, y1, x2, y2], [x1, y1, x2, y2], ...
+                traj_id: trajectory id
+    det: detection result
+    format: {}
+            key:
+                image name
+            val:
+                bbox: [[x1, y1, x2, y2], [x1, y1, x2, y2], ...]
+"""
+#def EvalAssn(anno, det, vid_name, ov_thr=0.5):
+def EvalAssn(anno, det, ov_thr=0.5):
+    assn_res = {}
+
+    im_list = det.keys()
+    im_list = sorted(im_list, key = lambda x: int(x))
+
+    vid_traj = {}
+
+    for i in range(len(im_list)):
+        im_name = im_list[i]
+        if not im_name in anno.keys(): continue
+        nw_gt = anno[im_name]
+        nw_gt_bbox = nw_gt['bbox'].astype(float)
+        nw_traj_id = nw_gt['traj_id']
+        nw_bbox = det[im_name]['bbox'].astype(float)
+
+        #print len(nw_gt_bbox), len(nw_bbox)
+        matched, _ = BigraphMatch(nw_gt_bbox, nw_bbox, ov_thr)
+        for m in range(len(matched)):
+            m_gt = matched[m, 0]
+            m_det = matched[m, 1]
+            m_traj = nw_traj_id[m_gt]
+
+            m_gt_bbox = nw_gt_bbox[m_gt, :]
+            m_det_bbox = nw_bbox[m_det, :]
+
+            #display(im_name, m_gt_bbox, m_det_bbox)
+            _x, _y, _w, _h, _ratio, _area  = GetStabilityErr(m_gt_bbox, m_det_bbox)
+            
+            if not (m_traj in assn_res.keys()):
+                assn_res[m_traj] = []
+            assn_res[m_traj].append(Info(im_name, _x, _y, _w, _h, _ratio, _area))
+
+            if not im_name in vid_traj:
+                vid_traj[im_name] = []
+            vid_traj[im_name].append([m_traj, m_det_bbox[0], m_det_bbox[1], m_det_bbox[2], m_det_bbox[3]])
+
+    anno_gt = {}
+    for gt in anno:
+        _traj = anno[gt]['traj_id']
+        for t in range(len(_traj)):
+            if not (_traj[t] in anno_gt.keys()):
+                anno_gt[_traj[t]] = []
+            anno_gt[_traj[t]].append(gt)
+
+    F_err, var_c, var_r = TrajErr(anno_gt, assn_res)
+
+    '''
+    vid_out = json.dumps(vid_traj)
+    outdir = 'visualize/2015/output/kitti_weighted_nms_mf_pf/'
+    if not os.path.exists(outdir): os.makedirs(outdir)
+    with open(os.path.join(outdir, '{}.json'.format(vid_name)), 'w') as f:
+        f.write(vid_out)
+    '''
+
+    return F_err, var_c, var_r
+
+
